@@ -9,12 +9,41 @@ and their signatures must not change.
 """
 
 from __future__ import annotations
+from collections import OrderedDict
 
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from sklearn.metrics import f1_score
 from sklearn.preprocessing import StandardScaler
+
+torch.manual_seed(0)
+
+class Net(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.lhs_factor = 0.04087
+        clf_in_dim = 44
+        self.lin0 = nn.Linear(896, clf_in_dim)
+        self.lin1 = nn.Linear(10, clf_in_dim)
+        self.lin4 = nn.Linear(24, clf_in_dim)
+        self.sp_lhs_coef = nn.Linear(2, 1)
+        self.sp_lhs_coef.load_state_dict(OrderedDict([('weight', torch.tensor([[1., 0.]])), ('bias', torch.tensor([-2.]))]))
+        self.sp_ent_coef = nn.Parameter(torch.tensor([[0.0]]))
+        self.sp_chk_coef = nn.Linear(2, 1)
+        self.sp_chk_coef.load_state_dict(OrderedDict([('weight', torch.tensor([[1., 0.]])), ('bias', torch.tensor([-2.]))]))
+        self.clf = nn.Linear(clf_in_dim + 2, 2)
+
+    def forward(self, x):
+        lhs, ent, sp, chk = x[:,:896], x[:,896:905], x[:,905:907], x[:,907:]
+        lhs_x = self.lin0(lhs) * F.sigmoid(self.sp_lhs_coef(sp)) * self.lhs_factor
+        ent_x = self.lin1(torch.cat((ent, sp[:,1:]), dim=1)) * (1.0 - sp[:,:1]) * (1.0 - F.sigmoid(self.sp_ent_coef) * sp[:,1:])
+        chk_x = self.lin4(chk) * F.sigmoid(self.sp_chk_coef(sp)) 
+        a = F.elu(lhs_x + ent_x + chk_x)
+        h = torch.cat((a, sp), dim=1)
+        logits = self.clf(h)
+        return logits
 
 
 class HallucinationProbe(nn.Module):
@@ -27,7 +56,7 @@ class HallucinationProbe(nn.Module):
 
     def __init__(self) -> None:
         super().__init__()
-        self._net: nn.Sequential | None = None  # built lazily in fit()
+        self._net: Net | None = None  # built lazily in fit()
         self._scaler = StandardScaler()
         self._threshold: float = 0.5  # tuned by fit_hyperparameters()
 
@@ -42,28 +71,24 @@ class HallucinationProbe(nn.Module):
         Args:
             input_dim: Feature vector dimensionality.
         """
-        self._net = nn.Sequential(
-            nn.Linear(input_dim, 256),
-            nn.ReLU(),
-            nn.Linear(256, 1),
-        )
+        self._net = Net()
 
     # ------------------------------------------------------------------
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Forward pass — returns raw logits of shape ``(n_samples,)``.
+        """Forward pass — returns raw logits of shape ``(n_samples,2)``.
 
         Args:
             x: Float tensor of shape ``(n_samples, feature_dim)``.
 
         Returns:
-            1-D tensor of raw (pre-sigmoid) logits.
+            2-D tensor of raw (pre-softmax) logits.
         """
         if self._net is None:
             raise RuntimeError(
                 "Network has not been built yet. Call fit() before forward()."
             )
-        return self._net(x).squeeze(-1)
+        return self._net(x)
 
     def fit(self, X: np.ndarray, y: np.ndarray) -> "HallucinationProbe":
         """Train the probe on labelled feature vectors.
@@ -79,26 +104,23 @@ class HallucinationProbe(nn.Module):
         Returns:
             ``self`` (for method chaining).
         """
-        X_scaled = self._scaler.fit_transform(X)
+        X_scalable = np.concatenate((X[:,:905], X[:,907:]), axis=1)
+        X_scaled = self._scaler.fit_transform(X_scalable)
+        X_scaled = np.concatenate((X_scaled[:,:905], X[:,905:907], X_scaled[:,905:]), axis=1)
 
         self._build_network(X_scaled.shape[1])
 
         X_t = torch.from_numpy(X_scaled).float()
-        y_t = torch.from_numpy(y.astype(np.float32))
-
-        # Weight positive examples by neg/pos ratio to handle class imbalance.
-        n_pos = int(y.sum())
-        n_neg = len(y) - n_pos
-        pos_weight = torch.tensor([n_neg / max(n_pos, 1)], dtype=torch.float32)
-        criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+        y_t = torch.from_numpy(y.astype(int))
+        criterion = nn.CrossEntropyLoss()
 
         # ------------------------------------------------------------------
         # STUDENT: Replace or extend the training loop below.
         # ------------------------------------------------------------------
-        optimizer = torch.optim.Adam(self.parameters(), lr=1e-3)
+        optimizer = torch.optim.Adam(self.parameters(), lr=1.55556e-4)
 
         self.train()
-        for _ in range(200):
+        for _ in range(235):
             optimizer.zero_grad()
             logits = self(X_t)
             loss = criterion(logits, y_t)
@@ -169,10 +191,11 @@ class HallucinationProbe(nn.Module):
             estimated probability of the hallucinated class (label 1).
             Used to compute AUROC.
         """
-        X_scaled = self._scaler.transform(X)
+        X_scalable = np.concatenate((X[:,:905], X[:,907:]), axis=1)
+        X_scaled = self._scaler.fit_transform(X_scalable)
+        X_scaled = np.concatenate((X_scaled[:,:905], X[:,905:907], X_scaled[:,905:]), axis=1)
         X_t = torch.from_numpy(X_scaled).float()
         with torch.no_grad():
             logits = self(X_t)
-            prob_pos = torch.sigmoid(logits).numpy()
-        return np.stack([1.0 - prob_pos, prob_pos], axis=1)
-
+            prob_pos = torch.softmax(logits, dim=1).numpy()
+        return prob_pos

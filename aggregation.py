@@ -16,9 +16,84 @@ single entry point called from the notebook.
 """
 
 from __future__ import annotations
+import math
 
 import torch
+from torch import nn
+from transformers import AutoModelForCausalLM
 
+from model import MAX_LENGTH
+
+
+device = 'cuda' if torch.cuda.is_available() else 'cpu'
+
+
+model_name = 'Qwen/Qwen2.5-0.5B'
+model = AutoModelForCausalLM.from_pretrained(
+    model_name,
+    output_hidden_states=True,
+    torch_dtype=torch.bfloat16,
+)
+model = model.eval()
+
+lm_head = nn.Linear(896, 151936, bias=False)
+lm_head.load_state_dict(model.lm_head.state_dict())
+lm_head = lm_head.to(device)
+
+assistant_embedding = model.get_input_embeddings()(torch.tensor([77091])).to(device)
+im_start_embedding = model.get_input_embeddings()(torch.tensor([151644])).to(device)
+endoftext_embedding = model.get_input_embeddings()(torch.tensor([151643])).to(device)
+
+del model
+
+def detect_response_start(hidden_in):
+    """
+    Find the position in the sequence where the generation starts.
+    """
+    zero_tensor = torch.tensor([0.0]).to(device)
+    a_dist = torch.norm(hidden_in - assistant_embedding, dim=1)
+    a_indices = set(torch.where(a_dist.isclose(zero_tensor))[0].tolist())
+    i_dist = torch.norm(hidden_in - im_start_embedding, dim=1)
+    i_indices = set((torch.where(i_dist.isclose(zero_tensor))[0] + 1).tolist())
+    singleton_set = a_indices.intersection(i_indices)
+    if len(singleton_set) < 1:
+        return None
+    index = singleton_set.pop() + 2
+    if index >= MAX_LENGTH:
+        return None
+    return index
+
+def embedding_is_eos(e):
+    zero_tensor = torch.tensor([0.0]).to(device)
+    dist = torch.norm(e - endoftext_embedding)
+    ret = torch.isclose(dist, zero_tensor).item()
+    return ret
+
+def get_output_entropy(logits):
+    probs = torch.softmax(logits, dim=1)
+    logprobs = torch.log(probs)
+    entropy = -torch.sum(probs * logprobs, dim=1)
+    return entropy
+
+def get_entropies(hidden, start_index, end_index):
+    with torch.no_grad():
+        logits = lm_head(hidden[-1][start_index:end_index])
+    entropies = get_output_entropy(logits)
+    return entropies
+
+def extract_llm_check_features(hidden_states):
+    # hidden_states shape: (n_layers + 1, seq_len, hidden_dim)
+    n_layers = hidden_states.shape[0] - 1
+    seq_len = hidden_states.shape[1]
+    features = []
+    # Skip index 0 (input embeddings), iterate through actual layers
+    for l in range(1, n_layers + 1):
+        H_l = hidden_states[l]
+        singular_values = torch.linalg.svdvals(H_l)
+        singular_values = singular_values[singular_values > 1e-7]
+        hidden_score = (2.0 / seq_len) * torch.sum(torch.log(singular_values))
+        features.append(hidden_score.item())
+    return torch.tensor(features)
 
 def aggregate(
     hidden_states: torch.Tensor,
@@ -52,9 +127,54 @@ def aggregate(
     real_positions = attention_mask.nonzero(as_tuple=False)  # (n_real, 1)
     last_pos = int(real_positions[-1].item())                 # scalar index
 
-    feature = layer[last_pos]          # (hidden_dim,)
+    feature_0 = layer[last_pos].cpu()          # (hidden_dim,)
 
-    return feature
+    end_index = attention_mask.sum()
+    start_index = detect_response_start(hidden_states[0,:end_index])
+
+    if isinstance(start_index, int):
+        entropies = get_entropies(hidden_states, start_index, end_index)
+        feature_1 = torch.cat((
+            torch.amin(entropies, keepdim=True),
+            torch.quantile(
+                entropies,
+                torch.tensor(
+                    [0.25, 0.5, 0.75],
+                    dtype=entropies.dtype,
+                    device=entropies.device
+                )
+            ),
+            torch.amax(entropies, keepdim=True),
+            torch.mean(entropies, dim=0, keepdim=True),
+            torch.std(entropies, dim=0, unbiased=False, keepdim=True),
+            torch.tensor(
+                [math.log(len(entropies))],
+                dtype=entropies.dtype,
+                device=entropies.device
+            ),
+            entropies[:1]
+        ))
+        feature_2 = torch.tensor([0.0,])
+    else:
+        feature_1 = torch.zeros(size=(9,))
+        feature_2 = torch.tensor([1.0,])
+
+    if end_index < MAX_LENGTH or embedding_is_eos(hidden_states[0,-1]):
+        feature_3 = torch.tensor([0.0,])
+    else:
+        feature_3 = torch.tensor([1.0,])
+
+    feature_4 = extract_llm_check_features(hidden_states[:,:end_index])
+
+    all_features = (
+        feature_0.to(device),
+        feature_1.to(device),
+        feature_2.to(device),
+        feature_3.to(device),
+        feature_4.to(device)
+    )
+
+    return torch.cat(all_features)
     # ------------------------------------------------------------------
 
 
